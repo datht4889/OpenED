@@ -77,6 +77,10 @@ def add_data_args(parser: argparse.ArgumentParser):
     group.add_argument("--train-ratio", type=float, default=1)
     group.add_argument("--dev-num", type=int, default=-1)
     group.add_argument("--dev-ratio", type=float, default=1)
+    group.add_argument("--test-num", type=int, default=None,
+                       help="cap test rows separately from dev; defaults to --dev-num. "
+                            "Lets a run subsample dev for per-epoch selection while still "
+                            "scoring the full test set.")
     group.add_argument("--gen-num", type=int, default=-1)
     group.add_argument("--data-names", type=str, default=None)
     group.add_argument("--prompt-type", type=str, default=None)

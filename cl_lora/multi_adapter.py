@@ -99,7 +99,13 @@ class CLLoRAManager:
             for a in prevs:
                 if a not in la:
                     continue
-                cross = la[a].weight @ A_cur.t()             # (r_prev, r_cur)
+                # peft's autocast_adapter_dtype leaves adapters in fp32 or in the base
+                # dtype depending on version and on whether the adapter was created by
+                # get_peft_model or added later, so the two operands are not guaranteed
+                # to match (peft 0.18 mixes fp32 and bf16 here and the matmul raises).
+                # Computing the regulariser in fp32 is both version-proof and the more
+                # accurate choice; gradients still flow back to A_cur through the cast.
+                cross = la[a].weight.float() @ A_cur.float().t()   # (r_prev, r_cur)
                 total = total + (cross ** 2).sum()
         return self.orth_lambda * total
 

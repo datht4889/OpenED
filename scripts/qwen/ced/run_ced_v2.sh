@@ -17,7 +17,7 @@ set -euo pipefail
 MODE=ce_kd; PERM=0; DATA_PREFIX=ace_perm; RUN_NAME=""
 KD_RATIO=0.9; W_SPAN=2.0; KD_TYPE=sfkl; SKEW=0.1; SPAN_METRIC=cosine; LAYERS="22 25 28"
 BS=2; ACC=8; LR=0.0002; LR_LATER=""; EPOCHS=5; SEED=42; RANK=8; ALPHA=64
-GREEDY=0; START_TASK=0; END_TASK=4
+GREEDY=0; START_TASK=0; END_TASK=""   # empty = derive from streams.json (ACE 5 tasks, CRE 10)
 PL=0; BOOST=1; KD_SCOPE=replay; BAL=0; BAL_PT=10; BAL_LR=0.00002
 SELECT_BEST=0   # 1 = merge best-dev-F1 epoch per task instead of last epoch
 KDNEW=0         # LwF: KD weight on new-task rows' non-new-type tokens (0 = off)
@@ -88,6 +88,20 @@ GPUS_PER_NODE=${#GPUS[@]}
 
 RUN_ROOT="${BASE_PATH}/results/qwen3/ced/${RUN_NAME}"
 STREAMS_FILE="${BASE_PATH}/data/${DATA_PREFIX}${PERM}/streams.json"
+if [ -z "${END_TASK}" ]; then
+    # streams.json when present (build_ced_perms / cre_materialize_perm both write it),
+    # else count the numeric task subdirs so notebook-built dirs still work.
+    DATA_ROOT_DIR="${BASE_PATH}/data/${DATA_PREFIX}${PERM}"
+    if [ -f "${STREAMS_FILE}" ]; then
+        END_TASK=$(${ENV_BIN}/python -c "import json,sys; print(len(json.load(open(sys.argv[1])))-1)" "${STREAMS_FILE}")
+        echo "END_TASK not given, derived ${END_TASK} from streams.json"
+    else
+        END_TASK=$(find "${DATA_ROOT_DIR}" -mindepth 1 -maxdepth 1 -type d -regex '.*/[0-9]+' | wc -l)
+        END_TASK=$((END_TASK - 1))
+        [ "${END_TASK}" -ge 0 ] || { echo "no task subdirs under ${DATA_ROOT_DIR}; pass --end-task"; exit 1; }
+        echo "END_TASK not given, derived ${END_TASK} from task subdirs of ${DATA_ROOT_DIR}"
+    fi
+fi
 if [ -d "${RUN_ROOT}" ] && [ -n "$(find "${RUN_ROOT}" -mindepth 1 -maxdepth 1 -print -quit)" ] \
    && [ "${RESUME}" = "0" ]; then
     echo "refusing to overwrite existing run: ${RUN_ROOT}"

@@ -153,7 +153,8 @@ def prepare_dataset(args, tokenizer):
         print_rank("train num", len(data["train"]))
         data["dev"] = LMTrainDataset(args, tokenizer, args.data_dir, "valid", args.dev_num, args.dev_ratio, rng_sample)
 
-    data["test"] = LMTrainDataset(args, tokenizer, args.data_dir, "test", args.dev_num, args.dev_ratio, rng_sample)
+    test_num = args.test_num if args.test_num is not None else args.dev_num
+    data["test"] = LMTrainDataset(args, tokenizer, args.data_dir, "test", test_num, args.dev_ratio, rng_sample)
 
         
     # pre-trained dataset

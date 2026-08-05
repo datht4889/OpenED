@@ -510,8 +510,11 @@ def evaluate_loss(args, model, dataset, device):
         dataset, shuffle=False, drop_last=False, rank=dist.get_rank(),
         num_replicas=dist.get_world_size()
     )
+    # Use the training batch size, not eval_batch_size: the float32 cast below
+    # materialises batch x seq x vocab (32 x 768 x 151936 x 4B = 14.9 GB at
+    # eval_batch_size 32), which OOMs a 46 GB card before the first step.
     dataloader = DataLoader(
-        dataset, sampler=sampler, batch_size=args.eval_batch_size,
+        dataset, sampler=sampler, batch_size=args.batch_size,
         num_workers=args.num_workers, collate_fn=dataset.collate
     )
     loss_func = nn.CrossEntropyLoss()
