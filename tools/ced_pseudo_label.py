@@ -120,7 +120,7 @@ def main():
                 if not isinstance(e, list) or len(e) < 2:
                     continue
                 trig, ty = e[0], e[1]
-                if ty not in old_types:
+                if not isinstance(ty, str) or ty not in old_types:
                     continue
                 if not isinstance(trig, str) or trig not in sent:
                     continue

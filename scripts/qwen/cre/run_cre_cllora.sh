@@ -80,9 +80,8 @@ print(round(d[k]['trigger']['f1'], 4) if k in d else 'NA')
 " 2>/dev/null)
         log "OK ${M} final=${V:-NA}"
     else
-        log "FAILED ${M}"
-        tail -5 logs_${RUN_ID}.log 2>/dev/null \
-            | grep -E "Error|error|Killed|OutOfMemory|dtype" | tail -3
+        log "FAILED ${M}, see logs_${RUN_ID}.log"
+        grep -E "Error|Traceback|Killed|OutOfMemory|EADDRINUSE|assert|dtype" logs_${RUN_ID}.log 2>/dev/null | tail -5
     fi
     rm -f "${RUN}/checkpoint_latest.pt" "${RUN}/checkpoint_latest.pt.tmp"
 done

@@ -10,7 +10,7 @@ DATA_ROOT=${DATA_ROOT:-data_ced/ace_b10_perm0}
 EPOCHS=${EPOCHS:-5}
 NUM_TASKS=${NUM_TASKS:-5}
 PY=${PY:-$HOME/miniconda3/envs/nuquant/bin/python}
-cd ~/projects/OpenED_ced || exit 1
+cd "$(dirname "$0")/../../.." || exit 1
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=.
 RESUME_ARGS=()
 [ "${RESUME:-0}" = "1" ] && RESUME_ARGS+=(--resume)

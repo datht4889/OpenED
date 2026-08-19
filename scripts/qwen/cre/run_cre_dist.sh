@@ -90,6 +90,13 @@ log "CRE-DIST START ds=${DS} perm=${PERM} gpu=${GPU} tasks=${NTASK} methods='${M
 
 # ---- shared task0 (plain CE) ----
 if [ ! -d results/qwen3/ced/${T0RUN}/task0/merged ]; then
+    # merged/ is deleted by the cleanup at the bottom of this script after every successful
+    # sweep (disk space), so a re-run always lands here even when the rest of ${T0RUN} (log.txt,
+    # run_manifest.json) is still on disk from that earlier sweep. run_ced_v2.sh refuses to
+    # write into a non-empty run dir, so without this rm -rf the retrain fails immediately with
+    # "refusing to overwrite existing run" (this is exactly what stranded cre_tacred_task0_perm0
+    # with no F1 -- the guard fired on every later attempt and nobody cleared the stale dir).
+    rm -rf results/qwen3/ced/${T0RUN}
     wait_disk; wait_gpu
     log "=== ${T0RUN} (task0, plain CE) ==="
     bash ${RUNNER} --run-name ${T0RUN} --data-prefix ${DS}_perm --perm ${PERM} \

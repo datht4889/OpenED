@@ -2,12 +2,13 @@
 # Seven distillation baselines with a shared task0 checkpoint and the f12_pl protocol.
 set -euo pipefail
 
-cd ~/projects/OpenED || exit 1
+cd "$(dirname "$0")/../../.." || exit 1
 PERM=${PERM:-0}
 SEED=${SEED:-42}
 PROTOCOL=${PROTOCOL:-v2}
 GPU=${GPU:-0}
 RESUME=${RESUME:-0}
+DATA_PREFIX=${DATA_PREFIX:-ace_b10_perm}
 SHARED="dist_shared_task0_perm${PERM}_${PROTOCOL}_s${SEED}"
 
 if [ ! -f "results/qwen3/ced/${SHARED}/.complete" ]; then
@@ -17,7 +18,7 @@ if [ ! -f "results/qwen3/ced/${SHARED}/.complete" ]; then
     }
     echo "===== shared task0 ${SHARED} $(date) ====="
     bash scripts/qwen/ced/run_ced_v2.sh \
-        --run-name "${SHARED}" --mode sft --data-prefix ace_b10_perm --perm "${PERM}" \
+        --run-name "${SHARED}" --mode sft --data-prefix "${DATA_PREFIX}" --perm "${PERM}" \
         --rank 16 --alpha 64 --epochs 5 --lr 0.0002 --seed "${SEED}" \
         --bs 2 --acc 16 --greedy 1 --gpus "${GPU}" --end-task 0 \
         > "logs_${SHARED}.log" 2>&1
@@ -43,7 +44,7 @@ run_dist () {  # $1=method label $2=kd-type ($3...=optional runner flags)
         RESUME_ARGS+=(--resume)
     fi
     echo "===== ${RUN_NAME} (${KD_TYPE}) $(date) ====="
-    bash scripts/qwen/ced/run_ced_v2.sh --run-name "${RUN_NAME}" --mode ce_kd --data-prefix ace_b10_perm --perm "${PERM}" \
+    bash scripts/qwen/ced/run_ced_v2.sh --run-name "${RUN_NAME}" --mode ce_kd --data-prefix "${DATA_PREFIX}" --perm "${PERM}" \
         --kd-type "${KD_TYPE}" --w-span 0 --kd-ratio 0.9 --skew 0.1 --span-metric cosine --layers "22 25 28" \
         --rank 16 --alpha 64 --epochs 5 --lr 0.0002 --seed "${SEED}" --bs 2 --acc 16 \
         --greedy 1 --gpus "${GPU}" --start-task "${START_TASK}" \
