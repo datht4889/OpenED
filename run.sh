@@ -19,14 +19,15 @@
 #   bash run.sh maven "0" 0 1              # single perm, explicit GPUs
 #   bash run.sh rams "3 4" 0 1 cllora      # catch up missing perms on ONE queue only
 #
-# No-argument mode (`bash run.sh`): runs RAMS and GENEVA in full (nothing has ever run for
-# them, so "in full" and "only what's missing" are the same thing), then TACRED and FewRel
-# with the full perm range 0-4 -- the per-run skip logic already baked into
+# No-argument mode (`bash run.sh`): runs TACRED and FewRel first (finish CRE) with the full
+# perm range 0-4 -- the per-run skip logic already baked into
 # scripts/qwen/cre/run_cre_{dist,cllora}.sh (a completion marker check per method+perm) means
 # whatever CRE work already finished is left untouched and only the missing perms/methods
-# actually train. Datasets run ONE AT A TIME (dist+CL-LoRA concurrently within a dataset, next
-# dataset only after both queues of the current one finish) so at most one queue ever sits on
-# a given GPU. Order: rams, geneva, tacred, fewrel. Override with RUN_ALL_DATASETS="ds1 ds2 ...".
+# actually train -- then RAMS and GENEVA in full (nothing has ever run for them, so "in full"
+# and "only what's missing" are the same thing). Datasets run ONE AT A TIME (dist+CL-LoRA
+# concurrently within a dataset, next dataset only after both queues of the current one finish)
+# so at most one queue ever sits on a given GPU. Order: tacred, fewrel, rams, geneva. Override
+# with RUN_ALL_DATASETS="ds1 ds2 ...".
 #
 # queue (5th arg, default "both"): dist|cllora|both. Use this instead of running both queues
 # when only one baseline family is missing for that dataset -- launching the other queue
@@ -63,6 +64,11 @@ run_dist_queue () {   # $1=family $2=dataset $3=gpu $4..=perms
         else
             PERM=${p} GPU=${gpu} DATA_PREFIX="${ds}_b10_perm" bash scripts/qwen/ced/dist_queue.sh
         fi
+        # dist_queue.sh (CED) has no top-level FAILED marker of its own -- it dies silently
+        # under set -e -- so log it here regardless of family, or a crashed perm just looks
+        # like the queue quietly moved on.
+        local rc=$?
+        [ "${rc}" -eq 0 ] || echo "[run.sh] FAILED dist queue: family=${family} ds=${ds} perm=${p} (exit ${rc}), see the per-run log above/logs_*_${ds}.log"
     done
 }
 run_cllora_queue () {  # $1=family $2=dataset $3=gpu $4=methods $5..=perms
@@ -73,6 +79,8 @@ run_cllora_queue () {  # $1=family $2=dataset $3=gpu $4=methods $5..=perms
         else
             DATA_ROOT="data/${ds}_b10_perm${p}" bash scripts/qwen/ced/run_all_cllora.sh "${gpu}" ${methods}
         fi
+        local rc=$?
+        [ "${rc}" -eq 0 ] || echo "[run.sh] FAILED cllora queue: family=${family} ds=${ds} perm=${p} (exit ${rc}), see the per-run log above/logs_*_${ds}.log"
     done
 }
 
@@ -113,7 +121,7 @@ check_data () {  # $1=family $2=dataset $3=perms -- tokenizes both families; CED
 if [ $# -eq 0 ]; then
     # ---- no-argument mode: everything, one dataset at a time ----
     run_all () {
-        local datasets=${RUN_ALL_DATASETS:-"rams geneva tacred fewrel"}
+        local datasets=${RUN_ALL_DATASETS:-"tacred fewrel rams geneva"}
         local perms="0 1 2 3 4"
         for ds in ${datasets}; do
             local family; family=$(family_of "${ds}") || { echo "[run.sh:all] unknown dataset ${ds}, skipping"; continue; }
