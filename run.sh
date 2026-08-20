@@ -76,18 +76,36 @@ run_cllora_queue () {  # $1=family $2=dataset $3=gpu $4=methods $5..=perms
     done
 }
 
-check_data () {  # $1=family $2=dataset $3=perms -- tokenizes (cre) or checks the split exists (ced)
+check_data () {  # $1=family $2=dataset $3=perms -- tokenizes both families; CED tokenization
+                  # is NOT done by run_ced_v2.sh itself (it only tokenizes PL/balance side-data,
+                  # never the base task data -- confirmed the hard way against a real RAMS run),
+                  # so this has to run tools/process_data.py per task itself, same as the
+                  # hand-written maven_dist_perm14.sh that has been doing this successfully.
     local family=$1 ds=$2; shift 2
     if [ "${family}" = "cre" ]; then
         for p in "$@"; do
             bash scripts/qwen/cre/prep_cre.sh "${ds}" "${p}" || { echo "[run.sh] tokenize failed for ${ds} perm${p}"; return 1; }
         done
     else
+        local PY=${PY:-python3}
         for p in "$@"; do
             [ -s "data/${ds}_b10_perm${p}/streams.json" ] || {
                 echo "[run.sh] missing data/${ds}_b10_perm${p}/streams.json -- build it first (tools/build_maven_perms.py --src data/${ds} --out-prefix ${ds}_b10_perm)"
                 return 1
             }
+            for t in 0 1 2 3 4; do
+                local out="processed_data/${ds}_b10_perm${p}/${t}"
+                [ -d "${out}/qwen" ] && [ -n "$(ls -A "${out}/qwen" 2>/dev/null)" ] && continue
+                PYTHONPATH=. ${PY} tools/process_data.py \
+                    --data-dir "data/${ds}_b10_perm${p}/${t}/" --processed-data-dir "${out}" \
+                    --model-path Qwen/Qwen3-0.6B --data-process-workers 4 \
+                    --max-prompt-length 460 --t-max-prompt-length 640 \
+                    --dev-num 1000 --model-type qwen > "/tmp/tok_${ds}_p${p}t${t}.log" 2>&1 || {
+                    echo "[run.sh] tokenize failed for ${ds} perm${p} task${t}, see /tmp/tok_${ds}_p${p}t${t}.log"
+                    tail -10 "/tmp/tok_${ds}_p${p}t${t}.log"
+                    return 1
+                }
+            done
         done
     fi
 }

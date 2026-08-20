@@ -33,10 +33,13 @@ finished, so re-running the full perm range 0-4 is a no-op for anything already 
 Progress: `tail -f logs_run_all.log` (plus the per-dataset logs listed below once a
 dataset starts). Override the dataset list/order with `RUN_ALL_DATASETS="ds1 ds2 ..."`.
 
-One call runs one dataset end to end: tokenizes/checks the requested permutations, then
-launches the distillation queue (7 methods) on `gpu_dist` and the CL-LoRA queue (8 methods)
-on `gpu_cllora`, each working through its permutations in the background. No other setup
-step is needed.
+One call runs one dataset end to end: tokenizes the requested permutations, then launches
+the distillation queue (7 methods) on `gpu_dist` and the CL-LoRA queue (8 methods) on
+`gpu_cllora`, each working through its permutations in the background. No other setup step
+is needed. Tokenizing means running `tools/process_data.py` per task before training —
+`run_ced_v2.sh` does NOT do this itself (it only tokenizes PL/balance side-data, never the
+base task data), so `run.sh` does it explicitly for every task, same as CRE's `prep_cre.sh`;
+already-tokenized tasks are skipped on a re-run.
 
 ```bash
 bash run.sh rams                   # perms 0-4, distillation on gpu0, CL-LoRA on gpu1
@@ -47,9 +50,9 @@ bash run.sh tacred                 # CRE dataset, same interface
 tail -f logs_ced_dist_rams.log logs_ced_cllora_rams.log
 ```
 
-CED datasets (maven/rams/geneva) need their perm split built once before the first run —
-CRE datasets tokenize automatically inside `run.sh`, CED datasets just need the split to
-already exist on disk:
+CED datasets (maven/rams/geneva) additionally need their perm split **built once** before
+the first run (this only slices raw sentences into tasks/streams, separate from
+tokenization above):
 
 ```bash
 python tools/build_maven_perms.py --src data/rams --out-prefix rams_b10_perm --cap 10
