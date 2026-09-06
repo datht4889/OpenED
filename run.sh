@@ -19,6 +19,13 @@
 #   bash run.sh maven "0" 0 1              # single perm, explicit GPUs
 #   bash run.sh rams "3 4" 0 1 cllora      # catch up missing perms on ONE queue only
 #
+# OUR method (H2 pseudo-label dedup + H1 confidence filter + H3 matched calibration,
+# on the f12 protocol; reuses dist_queue's shared task0 per perm):
+#   bash run.sh ace "0 1 2 3 4" 0 - ours                   # ACE, all perms, gpu0
+#   bash run.sh maven "0 1 2 3 4" 1 - ours                 # MAVEN, all perms, gpu1
+#   OURS_VARIANT=h2  bash run.sh ace "0" 0 - ours          # ablation rungs: h2 | h12 | full
+#   RESUME=1 bash run.sh maven "2" 0 - ours                # resume a crashed perm
+#
 # No-argument mode (`bash run.sh`): runs TACRED and FewRel first (finish CRE) with the full
 # perm range 0-4 -- the per-run skip logic already baked into
 # scripts/qwen/cre/run_cre_{dist,cllora}.sh (a completion marker check per method+perm) means
@@ -81,6 +88,20 @@ run_cllora_queue () {  # $1=family $2=dataset $3=gpu $4=methods $5..=perms
         fi
         local rc=$?
         [ "${rc}" -eq 0 ] || echo "[run.sh] FAILED cllora queue: family=${family} ds=${ds} perm=${p} (exit ${rc}), see the per-run log above/logs_*_${ds}.log"
+    done
+}
+run_ours_queue () {   # $1=family $2=dataset $3=gpu $4..=perms — OUR method (CED only)
+    local family=$1 ds=$2 gpu=$3; shift 3
+    if [ "${family}" != "ced" ]; then
+        echo "[run.sh] ours queue is CED-only (got family=${family}), skipping"
+        return 1
+    fi
+    for p in "$@"; do
+        PERM=${p} GPU=${gpu} DATA_PREFIX="${ds}_b10_perm" \
+        OURS_VARIANT="${OURS_VARIANT:-full}" RESUME="${RESUME:-0}" \
+            bash scripts/qwen/ced/ours_queue.sh
+        local rc=$?
+        [ "${rc}" -eq 0 ] || echo "[run.sh] FAILED ours queue: ds=${ds} perm=${p} (exit ${rc}), see logs_ours_*_perm${p}_*.log"
     done
 }
 
@@ -149,10 +170,10 @@ GPU_DIST=${3:-0}
 GPU_CLLORA=${4:-1}
 QUEUE=${5:-both}
 
-FAMILY=$(family_of "${DS}") || { echo "unknown dataset '${DS}' (expected tacred|fewrel|maven|rams|geneva)"; exit 1; }
+FAMILY=$(family_of "${DS}") || { echo "unknown dataset '${DS}' (expected tacred|fewrel|maven|rams|geneva|ace)"; exit 1; }
 case "${QUEUE}" in
-    dist|cllora|both) ;;
-    *) echo "unknown queue '${QUEUE}' (expected dist|cllora|both)"; exit 1 ;;
+    dist|cllora|both|ours) ;;
+    *) echo "unknown queue '${QUEUE}' (expected dist|cllora|both|ours)"; exit 1 ;;
 esac
 
 echo "[run.sh] dataset=${DS} family=${FAMILY} perms='${PERMS}' gpu_dist=${GPU_DIST} gpu_cllora=${GPU_CLLORA} queue=${QUEUE}"
@@ -172,4 +193,12 @@ if [ "${QUEUE}" = "cllora" ] || [ "${QUEUE}" = "both" ]; then
     CLLORA_PID=$!
     echo "[run.sh] CL-LoRA queue running on gpu${GPU_CLLORA}, pid ${CLLORA_PID} -> logs_${FAMILY}_cllora_${DS}.log"
 fi
-echo "[run.sh] tail -f logs_${FAMILY}_dist_${DS}.log logs_${FAMILY}_cllora_${DS}.log"
+if [ "${QUEUE}" = "ours" ]; then
+    # OUR method (H2+H1+H3 on the f12 protocol). Variant via OURS_VARIANT=h2|h12|full.
+    setsid nohup bash -c "OURS_VARIANT='${OURS_VARIANT:-full}' RESUME='${RESUME:-0}' PL_PCT='${PL_PCT:-70}'; $(declare -f run_ours_queue); run_ours_queue \"\$@\"" _ \
+        "${FAMILY}" "${DS}" "${GPU_DIST}" ${PERMS} \
+        > "logs_${FAMILY}_ours_${DS}.log" 2>&1 < /dev/null &
+    OURS_PID=$!
+    echo "[run.sh] OURS queue (variant=${OURS_VARIANT:-full}) running on gpu${GPU_DIST}, pid ${OURS_PID} -> logs_${FAMILY}_ours_${DS}.log"
+fi
+echo "[run.sh] tail -f logs_${FAMILY}_dist_${DS}.log logs_${FAMILY}_cllora_${DS}.log logs_${FAMILY}_ours_${DS}.log"
