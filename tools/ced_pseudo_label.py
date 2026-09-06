@@ -1,20 +1,29 @@
-"""R6: teacher pseudo-labeling for CED.
+"""Teacher pseudo-labeling for CED (+ CL-DETR-style filtering).
 
 The previous-task teacher runs inference on the CURRENT task's train inputs and
 detects events of OLD types (the ones stripped from this task's gold responses
-— the main measured source of forgetting: 138-242 sentences/task on ACE).
-Detected old-type events are merged into the gold responses, restoring
-supervision the split removed.
+— measured on ACE: 18-24% of new-task sentences carry a stripped old-type
+trigger). Detected old-type events are merged into the gold responses,
+restoring the supervision the split removed.
 
-Rules:
-- only events whose type is in streams[<task_id]
+Filters, in order:
+- type must belong to streams[<task_id]
 - trigger text must appear verbatim in the input sentence
-- skip if the gold response already has an event with the same (trigger, type)
-- replay exemplars (all-old-type responses) are left untouched
+- H2 (--conflict-dedup, default on): drop the event if its trigger overlaps a
+  gold trigger of ANY type — never let a pseudo label contradict a gold label
+  on the same token (CL-DETR drops pseudo boxes with IoU>0.7 against gold)
+- exact (trigger, type) duplicates of gold are dropped
+- lexicon filter: (trigger, type) must occur in old tasks' gold train data
+- H1 (--conf-filter): teacher-confidence filter. Scores come free from
+  generate() via compute_transition_scores — no extra forward. An event's
+  score is the mean logprob of its trigger + type-name tokens (the decision
+  tokens); "percentile" keeps the top p% events of the task, "thresh" applies
+  an absolute mean-logprob cutoff.
 
 Usage:
   python tools/ced_pseudo_label.py --teacher <merged_dir> --data-dir data/ace_b10_perm0/1 \
-      --streams data/ace_b10_perm0/streams.json --task-id 1 --out data/r6_run/1 [--gpu 0]
+      --streams data/ace_b10_perm0/streams.json --task-id 1 --out data/r6_run/1 \
+      [--conf-filter percentile --conf-percentile 70]
 Writes train.jsonl (augmented) + dev/test copied unchanged, plus pl_stats.json.
 """
 import argparse
@@ -42,6 +51,54 @@ def parse_events(text):
         return []
 
 
+def find_spans(text, values, search_start=0):
+    """Char spans of each value in text, searched left-to-right."""
+    spans = []
+    pos = search_start
+    for val in values:
+        cs = text.find(val, pos)
+        if cs == -1:
+            cs = text.find(val)
+        if cs == -1:
+            spans.append(None)
+        else:
+            spans.append((cs, cs + len(val)))
+            pos = cs + len(val)
+    return spans
+
+
+def event_conf_score(text, trig, ty, gen_ids, token_logprobs, tokenizer):
+    """Mean logprob of the trigger + type-name tokens inside the generated text.
+
+    Token positions are recovered by re-tokenizing the decoded text; if the
+    re-tokenization disagrees with the actually generated ids (rare with clean
+    greedy JSON), fall back to the mean logprob of the whole sequence.
+    """
+    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    ids2 = enc["input_ids"]
+    n = min(len(ids2), len(gen_ids))
+    aligned = n > 0 and ids2[:n] == list(gen_ids[:n])
+
+    valid = token_logprobs[:len(gen_ids)]
+    if not aligned:
+        return float(valid.mean()) if len(valid) else None
+
+    offsets = enc["offset_mapping"]
+    mask = [False] * n
+    for span in find_spans(text, [trig, ty]):
+        if span is None:
+            continue
+        cs, ce = span
+        for j in range(n):
+            s, e = offsets[j]
+            if s < ce and e > cs and e > s:
+                mask[j] = True
+    idx = [j for j in range(min(n, len(valid))) if mask[j]]
+    if not idx:
+        return float(valid.mean()) if len(valid) else None
+    return float(valid[idx].mean())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--teacher", required=True)
@@ -54,6 +111,14 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=300)
     ap.add_argument("--lexicon-filter", type=int, default=1,
                     help="1: only accept (trigger,type) pairs seen in old tasks' gold train data")
+    ap.add_argument("--conflict-dedup", type=int, default=1,
+                    help="H2: drop pseudo events whose trigger overlaps any gold trigger (any type)")
+    ap.add_argument("--conf-filter", choices=["none", "percentile", "thresh"], default="none",
+                    help="H1: teacher-confidence filter over decision-token logprobs")
+    ap.add_argument("--conf-percentile", type=float, default=70.0,
+                    help="keep the top p%% highest-scored events of the task")
+    ap.add_argument("--conf-thresh", type=float, default=None,
+                    help="absolute mean-logprob cutoff (e.g. -0.5)")
     args = ap.parse_args()
 
     streams = json.load(open(args.streams))
@@ -83,6 +148,8 @@ def main():
                                                  device_map={"": device})
     model.eval()
 
+    need_scores = args.conf_filter != "none"
+
     # candidates: rows whose gold contains at least one NEW-type event (skip
     # replay exemplars and pure no-event rows keeps teacher calls low-risk)
     cand_idx = []
@@ -92,8 +159,11 @@ def main():
         if types - old_types:
             cand_idx.append(i)
 
-    n_aug_rows = 0
-    n_aug_events = 0
+    # pass 1: generate + hard filters; confidence filtering needs the full task
+    # score distribution, so candidate events are buffered and merged in pass 2.
+    pending = {}   # row_idx -> list of (event, score)
+    n_dropped_conflict = 0
+    n_seen = 0
     for b in range(0, len(cand_idx), args.batch_size):
         idxs = cand_idx[b:b + args.batch_size]
         prompts = []
@@ -107,15 +177,30 @@ def main():
                         truncation=True, max_length=1024).to(device)
         with torch.no_grad():
             out = model.generate(**enc, max_new_tokens=args.max_new_tokens,
-                                 do_sample=False, pad_token_id=tokenizer.eos_token_id)
-        texts = tokenizer.batch_decode(out[:, enc["input_ids"].shape[1]:],
-                                       skip_special_tokens=True)
-        for i, text in zip(idxs, texts):
+                                 do_sample=False, pad_token_id=tokenizer.eos_token_id,
+                                 return_dict_in_generate=need_scores,
+                                 output_scores=need_scores)
+        if need_scores:
+            sequences = out.sequences
+            # [bs, gen_len] logprob of each generated token — no extra forward
+            trans = model.compute_transition_scores(
+                sequences, out.scores, normalize_logits=True).float().cpu()
+        else:
+            sequences = out
+        gen_ids_batch = sequences[:, enc["input_ids"].shape[1]:].cpu()
+        texts = tokenizer.batch_decode(gen_ids_batch, skip_special_tokens=True)
+
+        for pos, (i, text) in enumerate(zip(idxs, texts)):
             r = rows[i]
             sent = input_text_of(r["user_prompt"]) or ""
             gold = json.loads(r["response"]).get("events", [])
             gold_keys = {(e[0], e[1]) for e in gold}
-            added = []
+            gold_triggers = {str(e[0]).lower() for e in gold if isinstance(e, list) and e}
+            if need_scores:
+                # strip padding/eos from the id/logprob views
+                gid = [t for t in gen_ids_batch[pos].tolist()
+                       if t != tokenizer.eos_token_id and t != tokenizer.pad_token_id]
+                lp = trans[pos]
             for e in parse_events(text):
                 if not isinstance(e, list) or len(e) < 2:
                     continue
@@ -126,6 +211,12 @@ def main():
                     continue
                 if (trig, ty) in gold_keys:
                     continue
+                # H2: never contradict a gold label on the same/overlapping token
+                if args.conflict_dedup:
+                    tl = trig.lower()
+                    if any(tl == g or tl in g or g in tl for g in gold_triggers):
+                        n_dropped_conflict += 1
+                        continue
                 if args.lexicon_filter and (trig.lower(), ty) not in lexicon:
                     continue
                 args_clean = []
@@ -136,14 +227,39 @@ def main():
                             args_clean.append([a[0], a[1]])
                 ev = [trig, ty, args_clean,
                       e[3] if len(e) > 3 and isinstance(e[3], str) else ""]
-                added.append(ev)
+                score = None
+                if need_scores:
+                    score = event_conf_score(text, trig, ty, gid, lp, tokenizer)
+                pending.setdefault(i, []).append((ev, score))
                 gold_keys.add((trig, ty))
-            if added:
-                rows[i]["response"] = json.dumps({"events": gold + added})
-                n_aug_rows += 1
-                n_aug_events += len(added)
+                n_seen += 1
         print(f"pseudo-label {min(b + args.batch_size, len(cand_idx))}/{len(cand_idx)} "
-              f"(+{n_aug_events} events on {n_aug_rows} rows)", flush=True)
+              f"(candidates so far: {n_seen}, conflict-dropped: {n_dropped_conflict})", flush=True)
+
+    # pass 2: H1 confidence filter over the whole task, then merge
+    all_scores = sorted(s for evs in pending.values() for _, s in evs if s is not None)
+    cutoff = None
+    if args.conf_filter == "percentile" and all_scores:
+        k = int(len(all_scores) * (1 - args.conf_percentile / 100.0))
+        cutoff = all_scores[min(k, len(all_scores) - 1)]
+    elif args.conf_filter == "thresh":
+        cutoff = args.conf_thresh
+
+    n_aug_rows = 0
+    n_aug_events = 0
+    n_dropped_conf = 0
+    for i, evs in pending.items():
+        kept = []
+        for ev, score in evs:
+            if cutoff is not None and score is not None and score < cutoff:
+                n_dropped_conf += 1
+                continue
+            kept.append(ev)
+        if kept:
+            gold = json.loads(rows[i]["response"]).get("events", [])
+            rows[i]["response"] = json.dumps({"events": gold + kept})
+            n_aug_rows += 1
+            n_aug_events += len(kept)
 
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "train.jsonl"), "w", encoding="utf-8") as f:
@@ -151,8 +267,17 @@ def main():
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     for split in ["dev.jsonl", "test.jsonl"]:
         shutil.copy(os.path.join(args.data_dir, split), os.path.join(args.out, split))
+
     stats = {"task_id": args.task_id, "candidates": len(cand_idx),
-             "aug_rows": n_aug_rows, "aug_events": n_aug_events}
+             "aug_rows": n_aug_rows, "aug_events": n_aug_events,
+             "dropped_conflict": n_dropped_conflict, "dropped_conf": n_dropped_conf,
+             "conf_filter": args.conf_filter, "conf_cutoff": cutoff}
+    if all_scores:
+        import statistics as st
+        qs = {f"p{q}": all_scores[int(len(all_scores) * q / 100)]
+              for q in (10, 30, 50, 70, 90) if len(all_scores) > 10}
+        stats["score_dist"] = {"n": len(all_scores), "mean": st.mean(all_scores),
+                               "min": all_scores[0], "max": all_scores[-1], **qs}
     with open(os.path.join(args.out, "pl_stats.json"), "w") as f:
         json.dump(stats, f)
     print("STATS", json.dumps(stats))

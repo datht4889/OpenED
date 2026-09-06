@@ -19,6 +19,10 @@ KD_RATIO=0.9; W_SPAN=2.0; KD_TYPE=sfkl; SKEW=0.1; SPAN_METRIC=cosine; LAYERS="22
 BS=2; ACC=8; LR=0.0002; LR_LATER=""; EPOCHS=5; SEED=42; RANK=8; ALPHA=64
 GREEDY=0; START_TASK=0; END_TASK=""   # empty = derive from streams.json (ACE 5 tasks, CRE 10)
 PL=0; BOOST=1; KD_SCOPE=replay; BAL=0; BAL_PT=10; BAL_LR=0.00002
+PL_DEDUP=1      # H2: drop pseudo events whose trigger overlaps a gold trigger (any type)
+PL_CONF=none    # H1: teacher-confidence filter {none, percentile, thresh}
+PL_CONF_PCT=70; PL_CONF_THRESH=""
+BAL_DIST=uniform  # H3: calibration pool distribution {uniform (legacy F4), matched (CL-DETR-style)}
 SELECT_BEST=0   # 1 = merge best-dev-F1 epoch per task instead of last epoch
 KDNEW=0         # LwF: KD weight on new-task rows' non-new-type tokens (0 = off)
 GPUS_ARG="0 1"  # which GPUs to use (space-separated); e.g. "0" for single-GPU
@@ -53,6 +57,11 @@ while [[ $# -gt 0 ]]; do
         --start-task) START_TASK=$2; shift 2;;
         --end-task) END_TASK=$2; shift 2;;
         --pl) PL=$2; shift 2;;
+        --pl-dedup) PL_DEDUP=$2; shift 2;;
+        --pl-conf) PL_CONF=$2; shift 2;;
+        --pl-conf-pct) PL_CONF_PCT=$2; shift 2;;
+        --pl-conf-thresh) PL_CONF_THRESH=$2; shift 2;;
+        --balance-dist) BAL_DIST=$2; shift 2;;
         --replay-boost) BOOST=$2; shift 2;;
         --kd-scope) KD_SCOPE=$2; shift 2;;
         --balanced-epoch) BAL=$2; shift 2;;
@@ -110,7 +119,7 @@ fi
 mkdir -p ${RUN_ROOT}
 MANIFEST="${RUN_ROOT}/run_manifest.json"
 MANIFEST_METHOD=${KD_TYPE}; [ "${MODE}" = "sft" ] && MANIFEST_METHOD=sft
-MANIFEST_CONFIG="mode=${MODE};kd_ratio=${KD_RATIO};w_span=${W_SPAN};kd_type=${KD_TYPE};skew=${SKEW};span_metric=${SPAN_METRIC};layers=${LAYERS};pl=${PL};boost=${BOOST};kd_scope=${KD_SCOPE};balance=${BAL}/${BAL_PT}/${BAL_LR};select_best=${SELECT_BEST};kd_new=${KDNEW};lr=${LR}/${LR_LATER};train_num=${TRAIN_NUM};dev_num=${DEV_NUM};smoke_rows=${SMOKE_ROWS};eval_bs=${EVAL_BS};extra=${EXTRA_ARGS}"
+MANIFEST_CONFIG="mode=${MODE};kd_ratio=${KD_RATIO};w_span=${W_SPAN};kd_type=${KD_TYPE};skew=${SKEW};span_metric=${SPAN_METRIC};layers=${LAYERS};pl=${PL};pl_dedup=${PL_DEDUP};pl_conf=${PL_CONF}/${PL_CONF_PCT}/${PL_CONF_THRESH};boost=${BOOST};kd_scope=${KD_SCOPE};balance=${BAL}/${BAL_PT}/${BAL_LR}/${BAL_DIST};select_best=${SELECT_BEST};kd_new=${KDNEW};lr=${LR}/${LR_LATER};train_num=${TRAIN_NUM};dev_num=${DEV_NUM};smoke_rows=${SMOKE_ROWS};eval_bs=${EVAL_BS};extra=${EXTRA_ARGS}"
 MANIFEST_ARGS=(
     init --output "${MANIFEST}" --run "${RUN_NAME}" --method "${MANIFEST_METHOD}"
     --permutation "${PERM}" --seed "${SEED}" --data-root "${BASE_PATH}/data/${DATA_PREFIX}${PERM}"
@@ -209,10 +218,15 @@ do
         if [ "${PL}" = "1" ]; then
             PL_DIR="${BASE_PATH}/data/stage_${RUN_NAME}/${T}_pl"
             echo "===== ${RUN_NAME} task${T}: pseudo-labeling (teacher=${INIT_MODEL}) ====="
+            # keeping generate() scores for the confidence filter costs ~6GB VRAM
+            # -> halve the generation batch when the filter is on
+            PL_BS=64; [ "${PL_CONF}" != "none" ] && PL_BS=32
+            PL_OPTS="--conflict-dedup ${PL_DEDUP} --conf-filter ${PL_CONF} --conf-percentile ${PL_CONF_PCT}"
+            [ -n "${PL_CONF_THRESH}" ] && PL_OPTS+=" --conf-thresh ${PL_CONF_THRESH}"
             ${ENV_BIN}/python ${BASE_PATH}/tools/ced_pseudo_label.py \
                 --teacher ${INIT_MODEL} --data-dir ${STAGE} \
                 --streams ${STREAMS_FILE} --task-id ${T} \
-                --batch-size 64 \
+                --batch-size ${PL_BS} ${PL_OPTS} \
                 --out ${PL_DIR} > ${RUN_ROOT}/pl_task${T}.log 2>&1
             STAGE=${PL_DIR}
         fi
@@ -265,7 +279,7 @@ do
         echo "===== ${RUN_NAME} task${T}: balanced calibration epoch ====="
         ${ENV_BIN}/python ${BASE_PATH}/tools/ced_balance_pool.py \
             --data-dir ${STAGE} --streams ${STREAMS_FILE} --task-id ${T} \
-            --per-type ${BAL_PT} --seed ${SEED} \
+            --per-type ${BAL_PT} --dist ${BAL_DIST} --seed ${SEED} \
             --out ${POOL_RAW} > ${RUN_ROOT}/bal_task${T}.log 2>&1
         tokenize ${POOL_RAW} ${POOL_PROC} >> ${RUN_ROOT}/bal_task${T}.log 2>&1
         BAL_SAVE="${SAVE_PATH}_bal"

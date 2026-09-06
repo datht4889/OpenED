@@ -141,8 +141,13 @@ def get_model(args, device):
                     if args.do_train:
                         _model = PeftModel.from_pretrained(model, args.peft_path)
                         state_dict = dict(_model.state_dict().items())
+                        # target_modules must match the trained adapter exactly —
+                        # without it LoraConfig falls back to the peft default for
+                        # the architecture, and load_state_dict can silently build
+                        # a mismatched adapter structure
                         peft_config = LoraConfig(
-                            task_type=TaskType.CAUSAL_LM, inference_mode=(not args.do_train), r=args.peft_lora_r, lora_alpha=args.peft_lora_alpha, lora_dropout=args.peft_lora_dropout
+                            task_type=TaskType.CAUSAL_LM, inference_mode=(not args.do_train), r=args.peft_lora_r, lora_alpha=args.peft_lora_alpha, lora_dropout=args.peft_lora_dropout,
+                            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
                         )
                         model = get_peft_model(model, peft_config)
                         model.load_state_dict(state_dict)
