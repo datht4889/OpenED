@@ -121,6 +121,9 @@ def main():
                     help="absolute mean-logprob cutoff (e.g. -0.5)")
     args = ap.parse_args()
 
+    if args.conf_filter == "thresh" and args.conf_thresh is None:
+        ap.error("--conf-filter thresh requires --conf-thresh")
+
     streams = json.load(open(args.streams))
     old_types = set()
     for s in streams[:args.task_id]:
@@ -232,6 +235,10 @@ def main():
                     score = event_conf_score(text, trig, ty, gid, lp, tokenizer)
                 pending.setdefault(i, []).append((ev, score))
                 gold_keys.add((trig, ty))
+                if args.conflict_dedup:
+                    # an accepted pseudo trigger also blocks later overlapping
+                    # pseudo events (pseudo-vs-pseudo conflicts, not just gold)
+                    gold_triggers.add(trig.lower())
                 n_seen += 1
         print(f"pseudo-label {min(b + args.batch_size, len(cand_idx))}/{len(cand_idx)} "
               f"(candidates so far: {n_seen}, conflict-dropped: {n_dropped_conflict})", flush=True)
