@@ -17,6 +17,37 @@ pip install -r requirements.txt
 export CUDA_HOME=$HOME/miniconda3/envs/mta   # needed for deepspeed to detect nvcc
 ```
 
+`opened.txt` is the same pin list for hosts that install with uv. It no longer carries the
+`en_core_web_sm @ https://github.com/...whl` line: those hosts cannot reach GitHub, so the
+spaCy model is fetched as a zip by `download.txt` instead and unpacked afterwards.
+
+```bash
+cd /mnt/local/$PROJECT/OpenED                # where download.txt drops the zip
+python -c "import zipfile; zipfile.ZipFile('en_core_web_sm.zip').extractall('.')"
+rm -rf __MACOSX en_core_web_sm.zip           # zip was packed on a Mac
+```
+
+Python's `zipfile` rather than `unzip`: the image has no unzip binary and no sudo. It unpacks
+to `./en_core_web_sm/` (a model directory: `config.cfg` + `meta.json`, v3.8.0, which is what
+the pinned `spacy==3.8.14` wants), not an installed package — so `spacy.load("en_core_web_sm")`
+resolves it as a path and only works with the repo root as the working directory. Elsewhere,
+pass the full path. Nothing in this repo imports spaCy today, so if the pins are ever cleaned
+up, this model and the three `spacy*` lines in `opened.txt` can go with them.
+
+## Data
+
+`data/` holds the permutation splits. Every corpus is also published one dataset repo per
+corpus — [cl-ace](https://huggingface.co/datasets/datht/cl-ace),
+[cl-maven](https://huggingface.co/datasets/datht/cl-maven),
+[cl-rams](https://huggingface.co/datasets/datht/cl-rams),
+[cl-geneva](https://huggingface.co/datasets/datht/cl-geneva),
+[cl-tacred](https://huggingface.co/datasets/datht/cl-tacred),
+[cl-fewrel](https://huggingface.co/datasets/datht/cl-fewrel) — in a uniform shape
+(`raw/`, `perm<k>/`, `groups/`). `download.txt` fetches them file by file straight into the
+directory names the runners read (`data/<ds>`, `data/<ds>_b10_perm<k>` for CED,
+`data/<ds>_perm<k>` and `data/<ds>_groups` for CRE), so nothing needs renaming afterwards.
+Re-publish with `python tools/push_hf_datasets.py --dry-run` (drop the flag to push).
+
 ## Run
 
 ```bash

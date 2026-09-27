@@ -21,7 +21,7 @@
 #   bash run.sh geneva "" 0 1 prep         # tokenize only, train nothing
 #
 # No-argument mode (`bash run.sh`): every baseline run still missing, in the order
-# maven, rams, geneva -- see MISSING_PLAN below for which perms and which
+# maven, rams -- see MISSING_PLAN below for which perms and which
 # queue each dataset needs and why. Every runner skips its own finished work (a completion
 # marker per method+perm), so a dataset whose range is listed in full only trains the gaps,
 # and the plan stays correct as runs land. Datasets run ONE AT A TIME (dist+CL-LoRA
@@ -79,14 +79,16 @@ export RESUME=${RESUME:-0}   # both CED queues read this
 #           if that queue is lost -- cllora only, since run_cre_dist.sh deletes the shared
 #           task0 merged/ dir at the end of every sweep and retrains all five if it runs again.
 #   fewrel  nothing usable yet, so it needs the full sweep: MISSING_PLAN="fewrel:0 1 2 3 4:both"
+#   geneva  also queued elsewhere. Back with MISSING_PLAN="geneva:0 1 2 3 4:both" -- it has
+#           never run, so it needs every perm and both queues.
 # Still here:
 #   maven   perm0-1 are done for all 15 baselines, perm2 is partial, perm3-4 never ran. The
 #           full range is listed anyway: each runner skips its own finished work, so listing
 #           0-4 costs nothing and repairs perm2 without anyone having to track where it stopped.
-#   rams / geneva  nothing has ever run, everything trains.
+#   rams    nothing has ever run, everything trains.
 # Anything already complete is skipped by the runners themselves, so this stays correct as
 # runs land; override with MISSING_PLAN="ds:perms:queue;..." or RUN_ALL_DATASETS="ds1 ds2".
-export MISSING_PLAN=${MISSING_PLAN:-"maven:0 1 2 3 4:both;rams:0 1 2 3 4:both;geneva:0 1 2 3 4:both"}
+export MISSING_PLAN=${MISSING_PLAN:-"maven:0 1 2 3 4:both;rams:0 1 2 3 4:both"}
 
 # GPUs for no-argument mode (the single-dataset form takes them as arguments 3 and 4 instead).
 # One queue per GPU, always: the memory guards in the runners are snapshots, not reservations.
