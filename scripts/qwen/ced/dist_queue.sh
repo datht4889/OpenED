@@ -39,7 +39,7 @@ run_dist () {  # $1=method label $2=kd-type ($3...=optional runner flags)
             echo "partial run exists; set RESUME=1: ${RUN_NAME}"
             exit 1
         }
-        START_TASK=$(${HOME}/miniconda3/envs/mta/bin/python -c \
+        START_TASK=$(${ENV_BIN:-$HOME/miniconda3/envs/mta/bin}/python -c \
             "import json; print(json.load(open('${RUN_ROOT}/run_manifest.json'))['completed_task'] + 1)")
         RESUME_ARGS+=(--resume)
     fi

@@ -57,6 +57,15 @@ PERM_TAG=$(basename "${DATA_ROOT}" | sed -n 's/.*\(perm[0-9][0-9]*\).*/\1/p')
 [ -n "${PERM_TAG}" ] || { echo "cannot infer permutation from ${DATA_ROOT}"; exit 1; }
 RUN_ID="cllora_${METHOD}_${PERM_TAG}_${PROTOCOL}_s${SEED}"
 [ -n "${SAVE}" ] || SAVE="results/qwen3/ced/${RUN_ID}"
+# A finished run is a no-op, not an error. run.sh sweeps whole perm ranges so that only the
+# missing runs train; without this the overwrite guard below turns "already done" into exit 1,
+# which kills the rest of the queue (run_all_cllora.sh runs under set -e) the moment it reaches
+# a perm that finished earlier. run_cre_cllora.sh has always skipped on this marker; the CED
+# path did not, so re-running MAVEN perms 0-4 died on perm0.
+if [ -f "${SAVE}/.complete" ]; then
+    echo "SKIP complete: ${SAVE}"
+    exit 0
+fi
 if [ "${RESUME}" = "0" ]; then
     [ ! -e "${SAVE}/run_manifest.json" ] && [ ! -e "${SAVE}/cl_results.json" ] || {
         echo "refusing to overwrite existing run: ${SAVE}"

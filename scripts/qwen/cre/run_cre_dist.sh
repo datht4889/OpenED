@@ -66,7 +66,9 @@ final_f1 () { task_f1 "$1" "${LAST}"; }   # F1 of the run's last task
 wait_disk () {
     local free
     while true; do
-        free=$(df --output=avail -BG /mnt | tail -1 | tr -dc '0-9')
+        # DISK_PATH: /mnt is the scratch mount on A40_3/A40_4. On a host without it df
+        # errors, free comes back empty, and the loop below waits forever instead of training.
+        free=$(df --output=avail -BG "${DISK_PATH:-.}" 2>/dev/null | tail -1 | tr -dc '0-9')
         [ "${free:-0}" -ge "${NEED_DISK_GB}" ] && break
         log "DISK-WAIT ${free}G < ${NEED_DISK_GB}G"; sleep 300
     done

@@ -21,17 +21,64 @@ export CUDA_HOME=$HOME/miniconda3/envs/mta   # needed for deepspeed to detect nv
 
 ```bash
 bash run.sh                                                      # everything, see below
-bash run.sh <tacred|fewrel|maven|rams|geneva> ["perms"] [gpu_dist] [gpu_cllora]
+bash run.sh <tacred|fewrel|maven|rams|geneva> ["perms"] [gpu_dist] [gpu_cllora] [queue]
 ```
 
-`bash run.sh` with **no arguments** runs RAMS and GENEVA in full, then TACRED and FewRel —
-one dataset at a time (dist + CL-LoRA concurrently within a dataset, next dataset only
-starts once both queues of the current one finish, so no GPU ever gets two queues). For
-TACRED/FewRel this only trains what is actually missing: `run_cre_dist.sh` /
-`run_cre_cllora.sh` check a completion marker per method+perm and skip whatever already
-finished, so re-running the full perm range 0-4 is a no-op for anything already done.
-Progress: `tail -f logs_run_all.log` (plus the per-dataset logs listed below once a
-dataset starts). Override the dataset list/order with `RUN_ALL_DATASETS="ds1 ds2 ..."`.
+`bash run.sh` with **no arguments** runs **every baseline run still missing**, one dataset at
+a time (dist + CL-LoRA concurrently within a dataset, next dataset only starts once both
+queues of the current one finish, so no GPU ever gets two queues). The plan lives in
+`MISSING_PLAN` at the top of `run.sh` as `<dataset>:<perms>:<queue>` entries:
+
+| Dataset | Perms | Queue | Why |
+|---|---|---|---|
+| maven | 0-4 | both | perm0-1 done, perm2 partial, perm3-4 never ran — the finished parts skip themselves |
+| rams | 0-4 | both | never run |
+| geneva | 0-4 | both | never run |
+
+Both CRE datasets are out of the plan — they are already queued on the old host, so this is
+a CED-only sweep. Put one back if its queue is lost:
+
+```bash
+MISSING_PLAN="tacred:4:cllora"        bash run.sh   # cllora only: the dist queue would
+                                                    # retrain five task0 teachers for nothing
+MISSING_PLAN="fewrel:0 1 2 3 4:both"  bash run.sh   # nothing usable yet, full sweep
+```
+
+Only missing work trains: every runner checks its own completion marker per method+perm, so
+listing a full perm range is a no-op for whatever already finished. Progress:
+`tail -f logs_run_all.log` (plus the per-dataset logs listed below once a dataset starts).
+Override with `MISSING_PLAN="ds:perms:queue;..."`, or `RUN_ALL_DATASETS="ds1 ds2 ..."` for a
+plain list at all perms and both queues.
+
+### Running on a new server
+
+`data/` is in git, so the perm splits arrive with the clone and only tokenization runs per
+host. `results/` is **not** — none of the completion markers come along, so nothing is
+skipped and a plain `bash run.sh` retrains all 15 baselines on all five datasets (~3500
+single-task trainings), finished work included. Pick one first:
+
+```bash
+# either: bring the finished runs over, then run normally
+rsync -a --include='*/' --include='.complete' --include='cl_results.json' \
+      --include='log.txt' --exclude='*' OLDHOST:OpenED/results/ results/
+# or: give this host only part of the work
+MISSING_PLAN="fewrel:0 1 2 3 4:both" bash run.sh
+```
+
+Host-specific knobs, all optional, forwarded to the queues only when set:
+
+| Var | Default | Set it when |
+|---|---|---|
+| `GPU_DIST_ALL` / `GPU_CLLORA_ALL` | 0 / 1 | the two free GPUs are not 0 and 1 |
+| `PY` | `envs/nuquant/bin/python` (CED), `envs/mta/...` (CRE) | conda env is named differently |
+| `ENV_BIN` | `$HOME/miniconda3/envs/mta/bin` | same, for the KD runners |
+| `DISK_PATH` | `.` | the free-space guard should watch another filesystem |
+| `HF_HUB_OFFLINE` | 1 for CED CL-LoRA | the HF cache does not already hold Qwen3-0.6B (set 0) |
+
+**Not covered by either queue** (no runner script exists): LwF (ACE perm3-4), SeqLoRA-merge
+(ACE perm1-4), and f12_pl / ours (MAVEN perm1-4, TACRED, FewRel). LwF is a `run_ced_v2.sh`
+flag (`--kd-new`) and ours is `run_ced_v2.sh --mode ce_kd --pl 1`, but their exact configs
+are not checked in anywhere, so launch those by hand.
 
 One call runs one dataset end to end: tokenizes the requested permutations, then launches
 the distillation queue (7 methods) on `gpu_dist` and the CL-LoRA queue (8 methods) on
@@ -46,13 +93,16 @@ bash run.sh rams                   # perms 0-4, distillation on gpu0, CL-LoRA on
 bash run.sh geneva "0 1 2"         # only perm0-2
 bash run.sh maven "0" 0 1          # single perm, explicit GPU assignment
 bash run.sh tacred                 # CRE dataset, same interface
+bash run.sh rams "3 4" 0 1 cllora  # one queue only (dist|cllora|both, default both)
+bash run.sh geneva "" 0 1 prep     # tokenize all perms and stop, train nothing
 
 tail -f logs_ced_dist_rams.log logs_ced_cllora_rams.log
 ```
 
-CED datasets (maven/rams/geneva) additionally need their perm split **built once** before
-the first run (this only slices raw sentences into tasks/streams, separate from
-tokenization above):
+CED datasets need their perm split built once (raw sentences sliced into tasks/streams,
+separate from tokenization above). **ACE, MAVEN, RAMS and GENEVA are already built** —
+`data/<ds>_b10_perm{0..4}/{0..4}/{train,dev,test}.jsonl` plus `streams.json`. To rebuild, or
+for a new dataset:
 
 ```bash
 python tools/build_maven_perms.py --src data/rams --out-prefix rams_b10_perm --cap 10
@@ -63,10 +113,13 @@ python tools/build_maven_perms.py --src data/geneva --out-prefix geneva_b10_perm
 `{system_prompt, user_prompt, response}` record schema shared by ACE/MAVEN/RAMS/GENEVA)
 
 Notes:
-- `bash run.sh` with no arguments errors out — the dataset is required, and each call
-  covers exactly one dataset. Run once per dataset you need. On a 2-GPU box that means
-  running them one after the other, since each call already claims both GPUs (one queue
-  per GPU — see below).
+- CED run names carry no dataset of their own (`cllora_olora_perm0_v2_s42`), so `run.sh`
+  folds the dataset into the `PROTOCOL` tag for every CED dataset except ACE and MAVEN:
+  RAMS perm0 O-LoRA is `cllora_olora_perm0_rams_v2_s42`. Without that, RAMS/GENEVA at a
+  given perm would collide with the ACE/MAVEN run of the same perm on the same box. ACE and
+  MAVEN keep the bare `v2` so their existing run dirs stay recognized.
+- `RESUME=1 bash run.sh ...` forwards `--resume` to both CED queues, so a perm that died
+  mid-task continues from its manifest instead of aborting with "partial run exists".
 - Never run two queues on the same GPU. The memory/disk guards in the per-family runners
   (`scripts/qwen/cre/run_cre_*.sh` for CRE, `scripts/qwen/ced/{dist_queue,run_all_cllora}.sh`
   for CED) are snapshots, not reservations, and two queues racing for one card's memory

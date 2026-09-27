@@ -76,9 +76,9 @@ done
 
 GPUS=(${GPUS_ARG})
 export CUDA_VISIBLE_DEVICES=$(IFS=,; echo "${GPUS[*]}")
-ENV_BIN=$HOME/miniconda3/envs/mta/bin
-if [ -x "$HOME/miniconda3/envs/mta/bin/nvcc" ]; then
-    export CUDA_HOME=$HOME/miniconda3/envs/mta
+ENV_BIN=${ENV_BIN:-$HOME/miniconda3/envs/mta/bin}   # override on a host with a differently named env
+if [ -x "${ENV_BIN}/nvcc" ]; then
+    export CUDA_HOME=$(dirname "${ENV_BIN}")
 fi
 export PATH=${ENV_BIN}:$PATH
 

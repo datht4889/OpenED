@@ -11,7 +11,7 @@ EPOCHS=${EPOCHS:-5}
 NUM_TASKS=${NUM_TASKS:-5}
 PY=${PY:-$HOME/miniconda3/envs/nuquant/bin/python}
 cd "$(dirname "$0")/../../.." || exit 1
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=.
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1} PYTHONPATH=.
 RESUME_ARGS=()
 [ "${RESUME:-0}" = "1" ] && RESUME_ARGS+=(--resume)
 for M in "$@"; do
