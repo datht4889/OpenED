@@ -283,6 +283,14 @@ def add_ced_args(parser: argparse.ArgumentParser):
                        help="fkl = KL(teacher||student) (SDFT code default), rkl = KL(student||teacher)")
     group.add_argument("--ced-sd-probe", type=int, default=64,
                        help="rows used to check, before training, that the teacher copies the reference (0 = off)")
+    # Ablation knobs. The defaults reproduce SDFT; none of these is part of the method.
+    # (Samples cut off by the token budget are always dropped from the SD loss, no flag.)
+    group.add_argument("--ced-sd-top-p", type=float, default=1.0,
+                       help="nucleus p of the on-policy sample (SDFT: 1.0)")
+    group.add_argument("--ced-sd-skip-unparsed", action="store_true",
+                       help="also drop samples that are not valid JSON from the SD loss")
+    group.add_argument("--ced-sd-warmup", type=float, default=0.0,
+                       help="fraction of total_iters to train before SD starts (0 = from step 1)")
     # CL-LoRA baselines (cl_lora/): which method + its reg/ratio knobs
     group.add_argument("--cl-method", type=str, default=None,
                        choices=["inclora", "olora", "migu", "tree",

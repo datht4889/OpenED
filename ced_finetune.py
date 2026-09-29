@@ -366,12 +366,25 @@ def sd_gather(logits, pos):
     return logits.gather(1, pos.unsqueeze(-1).expand(-1, -1, logits.size(-1)))
 
 
-def sd_prepare(args, model, ema, gen_data, no_model_batch, device):
+def sd_parses(text):
+    """Strict JSON, the same bar ed_eval.py scores a prediction against."""
+    try:
+        json.loads(text.strip())
+        return True
+    except Exception:
+        return False
+
+
+def sd_prepare(args, tokenizer, model, ema, gen_data, no_model_batch, device):
     """Sample one response per prompt from the current student, then score it
     with the EMA teacher under the teacher prompt. Runs before the step's
-    grad-tracking forwards (see sd_ema_weights)."""
+    grad-tracking forwards (see sd_ema_weights).
+
+    Returns (sd_batch, stats). sd_batch is None when no row survives, and the
+    caller must then skip the SD loss: forward_kl/reverse_kl divide by the
+    number of unmasked tokens, so an empty batch would give NaN."""
     gen_config = GenerationConfig(
-        do_sample=True, top_p=1.0, top_k=0, temperature=args.ced_sd_temperature,
+        do_sample=True, top_p=args.ced_sd_top_p, top_k=0, temperature=args.ced_sd_temperature,
         eos_token_id=list(SD_EOS_IDS), pad_token_id=SD_EOS_IDS[0],
         return_dict_in_generate=True, output_scores=False)
     P = gen_data["input_ids"].size(1)
@@ -382,16 +395,29 @@ def sd_prepare(args, model, ema, gen_data, no_model_batch, device):
 
     # real prompt tokens come from the attention mask: pad == eos == <|im_end|>,
     # which also appears inside the chat prompt, so filtering by pad id is wrong
-    prompts, responses = [], []
+    t_prompt_ids = no_model_batch["t_prompt_ids"]
+    stats = {"rows": seqs.size(0), "truncated": 0, "unparsed": 0, "kept": 0}
+    prompts, responses, t_prompts = [], [], []
     for i in range(seqs.size(0)):
-        prompts.append(gen_data["input_ids"][i][gen_data["attention_mask"][i].bool()])
         r = seqs[i, P:]
         stop = (r == SD_EOS_IDS[0]) | (r == SD_EOS_IDS[1])
-        if stop.any():
-            r = r[:stop.nonzero()[0].item() + 1]
+        if not stop.any():
+            # Cut off by the token budget, so it ends mid-object. Distilling it
+            # could only teach the student to leave its JSON unterminated.
+            stats["truncated"] += 1
+            continue
+        r = r[:stop.nonzero()[0].item() + 1]
+        if args.ced_sd_skip_unparsed and not sd_parses(tokenizer.decode(r, skip_special_tokens=True)):
+            stats["unparsed"] += 1
+            continue
+        prompts.append(gen_data["input_ids"][i][gen_data["attention_mask"][i].bool()])
         responses.append(r)
+        t_prompts.append(t_prompt_ids[i].to(device))
+    stats["kept"] = len(responses)
+    if not responses:
+        model.train()
+        return None, stats
 
-    t_prompts = [p.to(device) for p in no_model_batch["t_prompt_ids"]]
     t_ids, t_mask, t_pos, label = sd_pack(t_prompts, responses, SD_EOS_IDS[0], device)
     with torch.no_grad(), sd_ema_weights(model, ema):
         t_logits = model(input_ids=t_ids, attention_mask=t_mask, use_cache=False).logits
@@ -404,7 +430,7 @@ def sd_prepare(args, model, ema, gen_data, no_model_batch, device):
     assert torch.equal(t_ids.gather(1, t_pos + 1)[valid], label[valid])
     assert torch.equal(s_ids.gather(1, s_pos + 1)[valid], label[valid])
     return {"ids": s_ids, "mask": s_mask, "pos": s_pos, "label": label, "t_logits": t_logits,
-            "resp_len": sum(len(r) for r in responses) / len(responses)}
+            "resp_len": sum(len(r) for r in responses) / len(responses)}, stats
 
 
 def sd_loss_fn(args, model, sd):
@@ -456,6 +482,24 @@ def sd_probe(args, tokenizer, model, ema, dataset, device):
                f"arg F1 {no_ref['argument']['f1']:.4f} | prompt suffix mismatch {mismatch}/{len(dataset.lm_ctx)}")
     print_rank(log_str)
     save_rank(log_str, os.path.join(args.save, "log.txt"))
+
+    # Warn rather than stop, so one weak probe does not take the rest of a queue down.
+    gap = with_ref["trigger"]["f1"] - no_ref["trigger"]["f1"]
+    problems = []
+    if gap < 0.03:
+        problems.append(f"the reference in the teacher prompt adds only {gap:+.4f} trigger F1, "
+                        f"so the teacher knows little the student does not")
+    if mismatch:
+        # The two prompts should end in the same generation suffix. [:max] truncation in
+        # tools/process_data.py drops the tail, so a mismatch means one side lost
+        # <|im_start|>assistant: the teacher (over --t-max-prompt-length) or the student
+        # (over --max-prompt-length 460, which already happens for a few MAVEN/RAMS rows).
+        problems.append(f"{mismatch} rows end in different prompt suffixes, one side was "
+                        f"truncated past its generation prompt")
+    for p in problems:
+        warn = f"WARNING sd probe: {p}"
+        print_rank(warn)
+        save_rank(warn, os.path.join(args.save, "log.txt"))
 
 
 def compute_token_weights(hidden_state, attention_mask):
@@ -756,6 +800,9 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
     sd_ema = None
     total_sd_loss, total_sd_len = 0.0, 0.0
+    # per log window: how many micro-steps actually distilled, and what happened to the samples
+    SD_STAT_KEYS = ("steps", "active", "rows", "truncated", "unparsed", "kept")
+    sd_win = dict.fromkeys(SD_STAT_KEYS, 0)
     if args.ced_sd:
         assert not args.student_gen, "--ced-sd and --student-gen both replace generation; use one"
         assert dataset["train"].t_lm_ctx is not None, \
@@ -851,7 +898,15 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 model.train()
 
             # SD sampling + EMA-teacher scoring come before the grad-tracking forwards
-            sd_batch = sd_prepare(args, model, sd_ema, gen_data, no_model_batch, device) if args.ced_sd else None
+            sd_batch = None
+            if args.ced_sd:
+                sd_win["steps"] += 1
+                # warmup is an ablation knob (default 0); EMA keeps tracking the student during it
+                if global_step > args.ced_sd_warmup * args.total_iters:
+                    sd_batch, st = sd_prepare(args, tokenizer, model, sd_ema, gen_data, no_model_batch, device)
+                    for k in ("rows", "truncated", "unparsed", "kept"):
+                        sd_win[k] += st[k]
+                    sd_win["active"] += int(sd_batch is not None)
 
             outputs = model(**model_batch, use_cache=False)
 
@@ -968,6 +1023,10 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 sd_loss = sd_loss_fn(args, model, sd_batch)
                 capture["on"] = True
                 loss = loss + args.ced_sd_weight * sd_loss
+            elif args.ced_sd:
+                # nothing to distill this step (warmup, or every sample dropped); keep a
+                # tensor so the all_reduce below runs on every rank and cannot hang
+                sd_loss = torch.zeros((), device=loss.device)
 
             if args.lm_data_dir is not None:
                 assert args.lm_coef is not None
@@ -982,10 +1041,11 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             dist.all_reduce(loss, dist.ReduceOp.SUM, group=dp_group)
             global_loss = loss.item() / dp_world_size
 
-            if sd_batch is not None:
+            if args.ced_sd:
                 dist.all_reduce(sd_loss, dist.ReduceOp.SUM, group=dp_group)
                 total_sd_loss += sd_loss.item() / dp_world_size
-                total_sd_len += sd_batch["resp_len"]
+                if sd_batch is not None:
+                    total_sd_len += sd_batch["resp_len"]
 
             global_distil_loss = 0
             if teacher_model is not None:
@@ -1033,12 +1093,18 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 save_rank(log_str, os.path.join(args.save, "log.txt"))
                 total_loss, total_distil_loss, total_time = 0.0, 0.0, 0.0
                 if sd_ema is not None:
-                    n_micro = args.log_interval * args.gradient_accumulation_steps
-                    sd_str = "sd | global iter: {:6d} | sd_loss: {:.4f} | resp_len: {:.1f}".format(
-                        global_step, total_sd_loss / n_micro, total_sd_len / n_micro)
+                    # averages over the steps that distilled; "active" says how many that was.
+                    # An arm whose active rate sits near 0 is plain training under another name.
+                    act, rows = max(sd_win["active"], 1), max(sd_win["rows"], 1)
+                    sd_str = ("sd | global iter: {:6d} | sd_loss: {:.4f} | resp_len: {:.1f} | "
+                              "active: {}/{} steps | kept: {:.3f} | truncated: {:.3f} | unparsed: {:.3f}").format(
+                        global_step, total_sd_loss / act, total_sd_len / act,
+                        sd_win["active"], sd_win["steps"], sd_win["kept"] / rows,
+                        sd_win["truncated"] / rows, sd_win["unparsed"] / rows)
                     print_rank(sd_str)
                     save_rank(sd_str, os.path.join(args.save, "log.txt"))
                     total_sd_loss, total_sd_len = 0.0, 0.0
+                    sd_win = dict.fromkeys(SD_STAT_KEYS, 0)
 
                 # --- MEMORY MEASUREMENT BLOCK ---
                 allocated   = torch.cuda.memory_allocated() / 1e9

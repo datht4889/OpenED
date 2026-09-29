@@ -11,6 +11,9 @@
 #                       # h12  = h2  + confidence percentile filter
 #                       # full = h12 + matched calibration epoch (H3)
 #   PL_PCT=70           # H1 percentile
+#   OURS_SD=0|1         # on-policy self-distillation on top (run name gets _sd)
+#   SD_ARGS="..."       # extra runner flags for SD, e.g. "--sd-temp 0.7 --sd-top-p 0.9"
+#   RUN_SUFFIX=_t07     # appended to the run name; keeps ablation/smoke arms apart
 set -euo pipefail
 
 cd "$(dirname "$0")/../../.." || exit 1
@@ -22,6 +25,9 @@ RESUME=${RESUME:-0}
 DATA_PREFIX=${DATA_PREFIX:-ace_b10_perm}
 OURS_VARIANT=${OURS_VARIANT:-full}
 PL_PCT=${PL_PCT:-70}
+OURS_SD=${OURS_SD:-0}
+SD_ARGS=${SD_ARGS:-}
+RUN_SUFFIX=${RUN_SUFFIX:-}
 SHARED="dist_shared_task0_perm${PERM}_${PROTOCOL}_s${SEED}"
 
 # shared task0 (plain SFT) — identical config to dist_queue's, reuse or create
@@ -47,7 +53,17 @@ case "${OURS_VARIANT}" in
     *) echo "unknown OURS_VARIANT '${OURS_VARIANT}' (h2|h12|full)"; exit 1 ;;
 esac
 
-RUN_NAME="ours_${OURS_VARIANT}_perm${PERM}_${PROTOCOL}_s${SEED}"
+# SD gets its own run name: without it `ours` and `ours + SD` at the same perm collide, and
+# the second is either refused (run exists) or, under RESUME=1, silently continues the first.
+SD_TAG=""
+if [ "${OURS_SD}" = "1" ]; then
+    # SD_ARGS is split on purpose: it carries several runner flags
+    # shellcheck disable=SC2206
+    VARIANT_ARGS+=(--sd 1 ${SD_ARGS})
+    SD_TAG="_sd"
+fi
+
+RUN_NAME="ours_${OURS_VARIANT}${SD_TAG}${RUN_SUFFIX}_perm${PERM}_${PROTOCOL}_s${SEED}"
 START_TASK=1
 RESUME_ARGS=()
 if [ -e "results/qwen3/ced/${RUN_NAME}" ]; then

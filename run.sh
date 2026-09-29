@@ -25,6 +25,8 @@
 #   bash run.sh maven "0 1 2 3 4" 1 - ours                 # MAVEN, all perms, gpu1
 #   OURS_VARIANT=h2  bash run.sh ace "0" 0 - ours          # ablation rungs: h2 | h12 | full
 #   RESUME=1 bash run.sh maven "2" 0 - ours                # resume a crashed perm
+#   OURS_SD=1 bash run.sh ace "0" 0 - ours                 # + self-distillation (run name _sd)
+#   OURS_SD=1 SD_ARGS="--sd-temp 0.7 --sd-top-p 0.9" RUN_SUFFIX=_t07 bash run.sh ace "0" 0 - ours
 #
 # No-argument mode (`bash run.sh`): runs TACRED and FewRel first (finish CRE) with the full
 # perm range 0-4 -- the per-run skip logic already baked into
@@ -99,6 +101,7 @@ run_ours_queue () {   # $1=family $2=dataset $3=gpu $4..=perms — OUR method (C
     for p in "$@"; do
         PERM=${p} GPU=${gpu} DATA_PREFIX="${ds}_b10_perm" \
         OURS_VARIANT="${OURS_VARIANT:-full}" RESUME="${RESUME:-0}" \
+        OURS_SD="${OURS_SD:-0}" SD_ARGS="${SD_ARGS:-}" RUN_SUFFIX="${RUN_SUFFIX:-}" \
             bash scripts/qwen/ced/ours_queue.sh
         local rc=$?
         [ "${rc}" -eq 0 ] || echo "[run.sh] FAILED ours queue: ds=${ds} perm=${p} (exit ${rc}), see logs_ours_*_perm${p}_*.log"
@@ -194,11 +197,15 @@ if [ "${QUEUE}" = "cllora" ] || [ "${QUEUE}" = "both" ]; then
     echo "[run.sh] CL-LoRA queue running on gpu${GPU_CLLORA}, pid ${CLLORA_PID} -> logs_${FAMILY}_cllora_${DS}.log"
 fi
 if [ "${QUEUE}" = "ours" ]; then
+    # SD and non-SD arms of the same dataset must not share a queue log
+    OURS_TAG=""
+    if [ "${OURS_SD:-0}" = "1" ]; then OURS_TAG="_sd"; fi
+    OURS_TAG="${OURS_TAG}${RUN_SUFFIX:-}"
     # OUR method (H2+H1+H3 on the f12 protocol). Variant via OURS_VARIANT=h2|h12|full.
-    setsid nohup bash -c "OURS_VARIANT='${OURS_VARIANT:-full}' RESUME='${RESUME:-0}' PL_PCT='${PL_PCT:-70}'; $(declare -f run_ours_queue); run_ours_queue \"\$@\"" _ \
+    setsid nohup bash -c "OURS_VARIANT='${OURS_VARIANT:-full}' RESUME='${RESUME:-0}' PL_PCT='${PL_PCT:-70}' OURS_SD='${OURS_SD:-0}' SD_ARGS='${SD_ARGS:-}' RUN_SUFFIX='${RUN_SUFFIX:-}'; $(declare -f run_ours_queue); run_ours_queue \"\$@\"" _ \
         "${FAMILY}" "${DS}" "${GPU_DIST}" ${PERMS} \
-        > "logs_${FAMILY}_ours_${DS}.log" 2>&1 < /dev/null &
+        > "logs_${FAMILY}_ours${OURS_TAG:-}_${DS}.log" 2>&1 < /dev/null &
     OURS_PID=$!
-    echo "[run.sh] OURS queue (variant=${OURS_VARIANT:-full}) running on gpu${GPU_DIST}, pid ${OURS_PID} -> logs_${FAMILY}_ours_${DS}.log"
+    echo "[run.sh] OURS queue (variant=${OURS_VARIANT:-full} sd=${OURS_SD:-0}${RUN_SUFFIX:+ suffix=${RUN_SUFFIX}}) running on gpu${GPU_DIST}, pid ${OURS_PID} -> logs_${FAMILY}_ours${OURS_TAG:-}_${DS}.log"
 fi
-echo "[run.sh] tail -f logs_${FAMILY}_dist_${DS}.log logs_${FAMILY}_cllora_${DS}.log logs_${FAMILY}_ours_${DS}.log"
+echo "[run.sh] tail -f logs_${FAMILY}_dist_${DS}.log logs_${FAMILY}_cllora_${DS}.log logs_${FAMILY}_ours${OURS_TAG:-}_${DS}.log"
