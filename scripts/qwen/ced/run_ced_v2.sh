@@ -11,6 +11,8 @@
 #   --kd-scope M         replay | pl (KD also on old-event tokens of pseudo rows) [replay]
 #   --balanced-epoch 0|1 extra calibration epoch on type-balanced pool [0]
 #   --balance-per-type N [10]   --balance-lr L [2e-5]
+#   --sd 0|1             on-policy self-distillation, EMA teacher reads gold+PL answer [0]
+#   --w-sd W [1.0]   --sd-mu M [0.99]   --sd-temp T [1.0]   --sd-div fkl|rkl [fkl]
 
 set -euo pipefail
 
@@ -25,6 +27,7 @@ PL_CONF_PCT=70; PL_CONF_THRESH=""
 BAL_DIST=uniform  # H3: calibration pool distribution {uniform (legacy F4), matched (CL-DETR-style)}
 SELECT_BEST=0   # 1 = merge best-dev-F1 epoch per task instead of last epoch
 KDNEW=0         # LwF: KD weight on new-task rows' non-new-type tokens (0 = off)
+SD=0; W_SD=1.0; SD_MU=0.99; SD_TEMP=1.0; SD_DIV=fkl   # on-policy self-distillation (SDFT)
 GPUS_ARG="0 1"  # which GPUs to use (space-separated); e.g. "0" for single-GPU
 EXTRA_ARGS=""   # raw extra flags appended to the ced_finetune step (e.g. DistiLLM off-policy)
 TASK0_SOURCE_RUN=""
@@ -69,6 +72,11 @@ while [[ $# -gt 0 ]]; do
         --balance-lr) BAL_LR=$2; shift 2;;
         --select-best-dev) SELECT_BEST=$2; shift 2;;
         --kd-ratio-new) KDNEW=$2; shift 2;;
+        --sd) SD=$2; shift 2;;
+        --w-sd) W_SD=$2; shift 2;;
+        --sd-mu) SD_MU=$2; shift 2;;
+        --sd-temp) SD_TEMP=$2; shift 2;;
+        --sd-div) SD_DIV=$2; shift 2;;
         --gpus) GPUS_ARG=$2; shift 2;;
         --extra) EXTRA_ARGS=$2; shift 2;;
         --task0-source-run) TASK0_SOURCE_RUN=$2; shift 2;;
@@ -119,7 +127,7 @@ fi
 mkdir -p ${RUN_ROOT}
 MANIFEST="${RUN_ROOT}/run_manifest.json"
 MANIFEST_METHOD=${KD_TYPE}; [ "${MODE}" = "sft" ] && MANIFEST_METHOD=sft
-MANIFEST_CONFIG="mode=${MODE};kd_ratio=${KD_RATIO};w_span=${W_SPAN};kd_type=${KD_TYPE};skew=${SKEW};span_metric=${SPAN_METRIC};layers=${LAYERS};pl=${PL};pl_dedup=${PL_DEDUP};pl_conf=${PL_CONF}/${PL_CONF_PCT}/${PL_CONF_THRESH};boost=${BOOST};kd_scope=${KD_SCOPE};balance=${BAL}/${BAL_PT}/${BAL_LR}/${BAL_DIST};select_best=${SELECT_BEST};kd_new=${KDNEW};lr=${LR}/${LR_LATER};train_num=${TRAIN_NUM};dev_num=${DEV_NUM};smoke_rows=${SMOKE_ROWS};eval_bs=${EVAL_BS};extra=${EXTRA_ARGS}"
+MANIFEST_CONFIG="mode=${MODE};kd_ratio=${KD_RATIO};w_span=${W_SPAN};kd_type=${KD_TYPE};skew=${SKEW};span_metric=${SPAN_METRIC};layers=${LAYERS};pl=${PL};pl_dedup=${PL_DEDUP};pl_conf=${PL_CONF}/${PL_CONF_PCT}/${PL_CONF_THRESH};boost=${BOOST};kd_scope=${KD_SCOPE};balance=${BAL}/${BAL_PT}/${BAL_LR}/${BAL_DIST};select_best=${SELECT_BEST};kd_new=${KDNEW};sd=${SD}/${W_SD}/${SD_MU}/${SD_TEMP}/${SD_DIV};lr=${LR}/${LR_LATER};train_num=${TRAIN_NUM};dev_num=${DEV_NUM};smoke_rows=${SMOKE_ROWS};eval_bs=${EVAL_BS};extra=${EXTRA_ARGS}"
 MANIFEST_ARGS=(
     init --output "${MANIFEST}" --run "${RUN_NAME}" --method "${MANIFEST_METHOD}"
     --permutation "${PERM}" --seed "${SEED}" --data-root "${BASE_PATH}/data/${DATA_PREFIX}${PERM}"
@@ -136,6 +144,7 @@ MANIFEST_ARGS=(
     --runtime-file "${BASE_PATH}/ed_eval.py"
     --runtime-file "${BASE_PATH}/configs/deepspeed/ds_config_bf16.json"
     --runtime-file "${BASE_PATH}/scripts/qwen/ced/run_ced_v2.sh"
+    --runtime-file "${BASE_PATH}/tools/ced_sd_prompts.py"
     --model "${BASE_MODEL}" --rank "${RANK}" --alpha "${ALPHA}" --dropout 0.1
     --gpu-count "${GPUS_PER_NODE}" --micro-batch "${BS}"
     --gradient-accumulation "${ACC}" --epochs "${EPOCHS}" --start-task "${START_TASK}"
@@ -150,14 +159,14 @@ if [ "${RESUME}" = "1" ]; then
         rm -rf "${RUN_ROOT}/task${STALE_TASK}"
     done
 fi
-echo "run=${RUN_NAME} mode=${MODE} perm=${PERM} data=${DATA_PREFIX} pl=${PL} boost=${BOOST} kd_scope=${KD_SCOPE} bal=${BAL}/${BAL_PT}/${BAL_LR} kd_ratio=${KD_RATIO} w_span=${W_SPAN} ${KD_TYPE}/${SKEW}/${SPAN_METRIC} layers='${LAYERS}' bs=${BS}x${ACC} lr=${LR}/${LR_LATER} ep=${EPOCHS} seed=${SEED} lora=${RANK}/${ALPHA} greedy=${GREEDY} task0_source=${TASK0_SOURCE_RUN:-none}" \
+echo "run=${RUN_NAME} mode=${MODE} perm=${PERM} data=${DATA_PREFIX} pl=${PL} boost=${BOOST} kd_scope=${KD_SCOPE} bal=${BAL}/${BAL_PT}/${BAL_LR} kd_ratio=${KD_RATIO} w_span=${W_SPAN} ${KD_TYPE}/${SKEW}/${SPAN_METRIC} layers='${LAYERS}' bs=${BS}x${ACC} lr=${LR}/${LR_LATER} ep=${EPOCHS} seed=${SEED} lora=${RANK}/${ALPHA} greedy=${GREEDY} sd=${SD}/${W_SD}/${SD_MU}/${SD_TEMP}/${SD_DIV} task0_source=${TASK0_SOURCE_RUN:-none}" \
     | tee ${RUN_ROOT}/run_config.txt
 
-tokenize () {  # $1=raw dir  $2=processed dir
+tokenize () {  # $1=raw dir  $2=processed dir  [$3=teacher prompt cap, default 640]
     PYTHONPATH=${BASE_PATH} ${ENV_BIN}/python ${BASE_PATH}/tools/process_data.py \
         --data-dir $1/ --processed-data-dir $2 \
         --model-path ${BASE_MODEL} --data-process-workers 4 \
-        --max-prompt-length 460 --t-max-prompt-length 640 \
+        --max-prompt-length 460 --t-max-prompt-length ${3:-640} \
         --dev-num 1000 --model-type qwen
 }
 
@@ -238,9 +247,19 @@ do
                 --boost ${BOOST} --out ${BO_DIR} >> ${RUN_ROOT}/pl_task${T}.log 2>&1
             STAGE=${BO_DIR}
         fi
+        T_CAP=640
+        if [ "${SD}" = "1" ]; then
+            # last data step: the teacher reference must be the final gold+PL answer
+            SD_DIR="${BASE_PATH}/data/stage_${RUN_NAME}/${T}_sd"
+            echo "===== ${RUN_NAME} task${T}: self-distillation teacher prompts ====="
+            ${ENV_BIN}/python ${BASE_PATH}/tools/ced_sd_prompts.py \
+                --data-dir ${STAGE} --out ${SD_DIR} >> ${RUN_ROOT}/pl_task${T}.log 2>&1
+            STAGE=${SD_DIR}
+            T_CAP=800   # prompt (<=460) + reference answer (<=308) + template
+        fi
         if [ "${STAGE}" != "${RAW_DIR}" ]; then
             PROC="${BASE_PATH}/processed_data/stage_${RUN_NAME}/${T}"
-            tokenize ${STAGE} ${PROC} >> ${RUN_ROOT}/pl_task${T}.log 2>&1
+            tokenize ${STAGE} ${PROC} ${T_CAP} >> ${RUN_ROOT}/pl_task${T}.log 2>&1
             DATA_DIR="${PROC}/qwen/"
         fi
     fi
@@ -256,6 +275,10 @@ do
         EXTRA+=" --ced-kd-ratio-new ${KDNEW}"
         EXTRA+=" --teacher_layer_mapping ${LAYERS} --student_layer_mapping ${LAYERS}"
         EXTRA+=" --w-span-loss ${W_SPAN} --span_metric ${SPAN_METRIC}"
+        if [ "${SD}" = "1" ]; then
+            EXTRA+=" --ced-sd --ced-sd-weight ${W_SD} --ced-sd-ema-mu ${SD_MU}"
+            EXTRA+=" --ced-sd-temperature ${SD_TEMP} --ced-sd-div ${SD_DIV}"
+        fi
         EXTRA+=" ${EXTRA_ARGS}"
     else
         EXTRA+=" --type lm"

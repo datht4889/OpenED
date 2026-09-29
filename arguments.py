@@ -270,6 +270,19 @@ def add_ced_args(parser: argparse.ArgumentParser):
                        help="hard cap on --ced-kd-ratio-new")
     group.add_argument("--ced-smoke-rows", type=int, default=0,
                        help="test only: balanced number of new/replay train rows (0 = full data)")
+    # on-policy self-distillation (SDFT): EMA teacher reads the augmented answer in its prompt
+    group.add_argument("--ced-sd", action="store_true",
+                       help="add on-policy self-distillation (needs teacher prompts from tools/ced_sd_prompts.py)")
+    group.add_argument("--ced-sd-weight", type=float, default=1.0,
+                       help="weight of the SD loss, added on top of the existing objective")
+    group.add_argument("--ced-sd-ema-mu", type=float, default=0.99,
+                       help="EMA teacher decay per optimizer step (SDFT: 0.99)")
+    group.add_argument("--ced-sd-temperature", type=float, default=1.0,
+                       help="sampling temperature of the on-policy response")
+    group.add_argument("--ced-sd-div", type=str, default="fkl", choices=["fkl", "rkl"],
+                       help="fkl = KL(teacher||student) (SDFT code default), rkl = KL(student||teacher)")
+    group.add_argument("--ced-sd-probe", type=int, default=64,
+                       help="rows used to check, before training, that the teacher copies the reference (0 = off)")
     # CL-LoRA baselines (cl_lora/): which method + its reg/ratio knobs
     group.add_argument("--cl-method", type=str, default=None,
                        choices=["inclora", "olora", "migu", "tree",

@@ -1,6 +1,7 @@
 import copy
 import time
 import os
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -290,6 +291,173 @@ def get_teacher_lm_loss(args, tokenizer, model, teacher_model, model_batch):
     return lm_loss
 
 
+# ---------------- on-policy self-distillation (SDFT) ----------------
+# The student's frozen base is the merged previous-task model and only the LoRA
+# tensors train, so the EMA teacher is that same base plus an EMA copy of the
+# LoRA tensors, swapped in for the teacher forward. The teacher reads the
+# augmented answer (gold + pseudo-labels) in its prompt; both models score the
+# same sampled response tokens.
+
+SD_EOS_IDS = (151645, 151643)  # <|im_end|>, <|endoftext|> (same stop set as evaluate())
+
+
+def sd_lora_params(model):
+    return {n: p for n, p in model.module.named_parameters() if p.requires_grad}
+
+
+def sd_ema_init(model):
+    return {n: p.detach().float().clone() for n, p in sd_lora_params(model).items()}
+
+
+def sd_ema_update(model, ema, mu):
+    with torch.no_grad():
+        for n, p in sd_lora_params(model).items():
+            ema[n].mul_(mu).add_(p.detach().float(), alpha=1.0 - mu)
+
+
+@contextmanager
+def sd_ema_weights(model, ema):
+    # in-place swap: must run before any grad-tracking forward of the same step,
+    # or autograd sees the LoRA tensors modified after being saved for backward
+    params = sd_lora_params(model)
+    saved = {n: p.detach().clone() for n, p in params.items()}
+    with torch.no_grad():
+        for n, p in params.items():
+            p.copy_(ema[n].to(p.dtype))
+    try:
+        yield
+    finally:
+        with torch.no_grad():
+            for n, p in params.items():
+                p.copy_(saved[n])
+
+
+def sd_left_pad(seqs, pad_id, device):
+    L = max(len(s) for s in seqs)
+    ids = torch.full((len(seqs), L), pad_id, dtype=torch.long, device=device)
+    mask = torch.zeros((len(seqs), L), dtype=torch.long, device=device)
+    for i, s in enumerate(seqs):
+        ids[i, L - len(s):] = s
+        mask[i, L - len(s):] = 1
+    return {"input_ids": ids, "attention_mask": mask}
+
+
+def sd_pack(prefixes, responses, pad_id, device):
+    """Right-padded [prefix, response] rows, plus the logit positions that predict
+    each response token (pos[i, j] predicts responses[i][j]) and a label tensor
+    holding the response tokens (-100 past each row's end)."""
+    bs = len(prefixes)
+    L = max(len(p) + len(r) for p, r in zip(prefixes, responses))
+    R = max(len(r) for r in responses)
+    ids = torch.full((bs, L), pad_id, dtype=torch.long, device=device)
+    mask = torch.zeros((bs, L), dtype=torch.long, device=device)
+    pos = torch.zeros((bs, R), dtype=torch.long, device=device)
+    label = torch.full((bs, R), -100, dtype=torch.long, device=device)
+    for i, (p, r) in enumerate(zip(prefixes, responses)):
+        n = len(p) + len(r)
+        ids[i, :n] = torch.cat([p, r])
+        mask[i, :n] = 1
+        pos[i, :len(r)] = torch.arange(len(p) - 1, n - 1, device=device)
+        label[i, :len(r)] = r
+    return ids, mask, pos, label
+
+
+def sd_gather(logits, pos):
+    return logits.gather(1, pos.unsqueeze(-1).expand(-1, -1, logits.size(-1)))
+
+
+def sd_prepare(args, model, ema, gen_data, no_model_batch, device):
+    """Sample one response per prompt from the current student, then score it
+    with the EMA teacher under the teacher prompt. Runs before the step's
+    grad-tracking forwards (see sd_ema_weights)."""
+    gen_config = GenerationConfig(
+        do_sample=True, top_p=1.0, top_k=0, temperature=args.ced_sd_temperature,
+        eos_token_id=list(SD_EOS_IDS), pad_token_id=SD_EOS_IDS[0],
+        return_dict_in_generate=True, output_scores=False)
+    P = gen_data["input_ids"].size(1)
+    model.eval()
+    with torch.no_grad():
+        seqs = model.generate(**gen_data, generation_config=gen_config,
+                              max_new_tokens=args.max_length - P).sequences
+
+    # real prompt tokens come from the attention mask: pad == eos == <|im_end|>,
+    # which also appears inside the chat prompt, so filtering by pad id is wrong
+    prompts, responses = [], []
+    for i in range(seqs.size(0)):
+        prompts.append(gen_data["input_ids"][i][gen_data["attention_mask"][i].bool()])
+        r = seqs[i, P:]
+        stop = (r == SD_EOS_IDS[0]) | (r == SD_EOS_IDS[1])
+        if stop.any():
+            r = r[:stop.nonzero()[0].item() + 1]
+        responses.append(r)
+
+    t_prompts = [p.to(device) for p in no_model_batch["t_prompt_ids"]]
+    t_ids, t_mask, t_pos, label = sd_pack(t_prompts, responses, SD_EOS_IDS[0], device)
+    with torch.no_grad(), sd_ema_weights(model, ema):
+        t_logits = model(input_ids=t_ids, attention_mask=t_mask, use_cache=False).logits
+        t_logits = sd_gather(t_logits, t_pos)
+    model.train()
+
+    s_ids, s_mask, s_pos, _ = sd_pack(prompts, responses, SD_EOS_IDS[0], device)
+    # both gathers must point at the logit that predicts the same response token
+    valid = label != -100
+    assert torch.equal(t_ids.gather(1, t_pos + 1)[valid], label[valid])
+    assert torch.equal(s_ids.gather(1, s_pos + 1)[valid], label[valid])
+    return {"ids": s_ids, "mask": s_mask, "pos": s_pos, "label": label, "t_logits": t_logits,
+            "resp_len": sum(len(r) for r in responses) / len(responses)}
+
+
+def sd_loss_fn(args, model, sd):
+    logits = model(input_ids=sd["ids"], attention_mask=sd["mask"], use_cache=False).logits
+    logits = sd_gather(logits, sd["pos"])
+    batch = {"label": sd["label"]}
+    if args.ced_sd_div == "rkl":
+        return reverse_kl(logits, sd["t_logits"], batch)
+    return forward_kl(logits, sd["t_logits"], batch)
+
+
+def sd_probe(args, tokenizer, model, ema, dataset, device):
+    """Before training: does the teacher copy the reference answer from its
+    prompt? Greedy-decode the first rows with and without the reference and
+    score both against the augmented answer. A teacher that ignores the
+    reference gives SD no signal (SDFT reports weak in-context use below 7B)."""
+    n = min(args.ced_sd_probe, len(dataset))
+    _, no_model_batch, gen_data, _, _ = dataset.collate([dataset[i] for i in range(n)])
+    rows = [dataset.sample_indices[i] if dataset.sample_indices is not None else i for i in range(n)]
+    refs = [dataset.answers[j] for j in rows]
+    gen_config = GenerationConfig(
+        do_sample=False, eos_token_id=list(SD_EOS_IDS), pad_token_id=SD_EOS_IDS[0],
+        return_dict_in_generate=True, output_scores=False)
+
+    def decode(prompt_seqs):
+        batch = sd_left_pad([s.to(device) for s in prompt_seqs], SD_EOS_IDS[0], device)
+        with torch.no_grad(), sd_ema_weights(model, ema):
+            seqs = model.generate(**batch, generation_config=gen_config,
+                                  max_new_tokens=args.max_length - args.max_prompt_length).sequences
+        return tokenizer.batch_decode(seqs[:, batch["input_ids"].size(1):], skip_special_tokens=True)
+
+    s_prompts = [gen_data["input_ids"][i][gen_data["attention_mask"][i].bool()] for i in range(n)]
+    model.eval()
+    with_ref = ed_evaluate(decode(no_model_batch["t_prompt_ids"]), refs)
+    no_ref = ed_evaluate(decode(s_prompts), refs)
+    model.train()
+
+    # a teacher prompt cut by --t-max-prompt-length loses its generation-prompt suffix
+    mismatch = 0
+    for j in range(len(dataset.lm_ctx)):
+        s = dataset.lm_ctx[j].astype(int)
+        t = dataset.t_lm_ctx[j].astype(int)
+        sp = s[:np.where(s == 4294967295)[0][0]]
+        tp = t[:np.where(t == 4294967295)[0][0]]
+        mismatch += int(not np.array_equal(sp[-4:], tp[-4:]))
+
+    log_str = (f"sd probe | rows {n} | teacher+ref trigger F1 {with_ref['trigger']['f1']:.4f} "
+               f"arg F1 {with_ref['argument']['f1']:.4f} | no ref trigger F1 {no_ref['trigger']['f1']:.4f} "
+               f"arg F1 {no_ref['argument']['f1']:.4f} | prompt suffix mismatch {mismatch}/{len(dataset.lm_ctx)}")
+    print_rank(log_str)
+    save_rank(log_str, os.path.join(args.save, "log.txt"))
+
+
 def compute_token_weights(hidden_state, attention_mask):
     std = hidden_state.std(dim=-1, keepdim=True) + 1e-5
     Q = hidden_state / std
@@ -573,8 +741,9 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
     student_captured_hidden = []
     hook_handles = []
+    capture = {"on": True}  # off during the SD student forward, whose states the span loss must not see
     def capture_hook_fn(module, input, output):
-        if module.training: 
+        if module.training and capture["on"]:
             if isinstance(output, tuple):
                 student_captured_hidden.append(output[0])
             else:
@@ -584,7 +753,17 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         for layer in model.base_model.model.model.layers:
             h_layer = layer.register_forward_hook(capture_hook_fn)
             hook_handles.append(h_layer)
-    
+
+    sd_ema = None
+    total_sd_loss, total_sd_len = 0.0, 0.0
+    if args.ced_sd:
+        assert not args.student_gen, "--ced-sd and --student-gen both replace generation; use one"
+        assert dataset["train"].t_lm_ctx is not None, \
+            "--ced-sd needs teacher prompts: run tools/ced_sd_prompts.py before tokenizing"
+        sd_ema = sd_ema_init(model)
+        if args.ced_sd_probe > 0:
+            sd_probe(args, tokenizer, model, sd_ema, dataset["train"], device)
+
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
 
@@ -670,6 +849,9 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                         f"student-gen replay sample: {replay_count}, buffer={len(replay_buffer)}"
                     )
                 model.train()
+
+            # SD sampling + EMA-teacher scoring come before the grad-tracking forwards
+            sd_batch = sd_prepare(args, model, sd_ema, gen_data, no_model_batch, device) if args.ced_sd else None
 
             outputs = model(**model_batch, use_cache=False)
 
@@ -780,16 +962,30 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             if lwf_active:
                 w_new = min(kd_ratio_new, getattr(args, "ced_kd_new_cap", 0.3))
                 loss = loss + w_new * distil_loss_new
-                
+
+            if sd_batch is not None:
+                capture["on"] = False
+                sd_loss = sd_loss_fn(args, model, sd_batch)
+                capture["on"] = True
+                loss = loss + args.ced_sd_weight * sd_loss
+
             if args.lm_data_dir is not None:
                 assert args.lm_coef is not None
                 loss += args.lm_coef * pt_loss(args, model, pt_model_batch, pt_no_model_batch)
-                
+
+            boundary = model.is_gradient_accumulation_boundary()
             model.backward(loss)
             model.step()
-             
+            if sd_ema is not None and boundary:
+                sd_ema_update(model, sd_ema, args.ced_sd_ema_mu)
+
             dist.all_reduce(loss, dist.ReduceOp.SUM, group=dp_group)
             global_loss = loss.item() / dp_world_size
+
+            if sd_batch is not None:
+                dist.all_reduce(sd_loss, dist.ReduceOp.SUM, group=dp_group)
+                total_sd_loss += sd_loss.item() / dp_world_size
+                total_sd_len += sd_batch["resp_len"]
 
             global_distil_loss = 0
             if teacher_model is not None:
@@ -836,6 +1032,13 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 print_rank("*" * 100)
                 save_rank(log_str, os.path.join(args.save, "log.txt"))
                 total_loss, total_distil_loss, total_time = 0.0, 0.0, 0.0
+                if sd_ema is not None:
+                    n_micro = args.log_interval * args.gradient_accumulation_steps
+                    sd_str = "sd | global iter: {:6d} | sd_loss: {:.4f} | resp_len: {:.1f}".format(
+                        global_step, total_sd_loss / n_micro, total_sd_len / n_micro)
+                    print_rank(sd_str)
+                    save_rank(sd_str, os.path.join(args.save, "log.txt"))
+                    total_sd_loss, total_sd_len = 0.0, 0.0
 
                 # --- MEMORY MEASUREMENT BLOCK ---
                 allocated   = torch.cuda.memory_allocated() / 1e9

@@ -326,7 +326,14 @@ class LMTrainDataset(Dataset):
 
             for i, samp in enumerate(samples):
                 self._process_lm(i, {"input_ids": samp["t_input_ids"]}, t_model_data, t_no_model_data, None)
-        
+
+            # SD: teacher prompt tokens (the part before the sentinel), kept unpadded;
+            # the sampled response is appended to them at train time.
+            no_model_data["t_prompt_ids"] = [
+                torch.tensor(samp["t_input_ids"][:np.where(samp["t_input_ids"] == 4294967295)[0][0]], dtype=torch.long)
+                for samp in samples
+            ]
+
         return model_data, no_model_data, gen_data, t_model_data, t_no_model_data
 
 
